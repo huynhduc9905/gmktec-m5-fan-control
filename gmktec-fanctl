@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+gmktec-fanctl - fan control for the ITE IT5570E EC found on the GMKtec M5 PLUS.
+
+The fan on this board is driven entirely by IT5570E firmware. There is no ACPI
+fan object and no hwmon PWM, so nothing in userspace can normally see or change
+it. This tool reaches the EC's internal address space through the SMFI indirect
+window exposed on the Super I/O port pair 0x4E/0x4F and edits the EC's own fan
+curve table, which the firmware then keeps enforcing on its own.
+
+See README.md for how the register map was determined.
+"""
+
+import argparse
+import fcntl
+import os
+import sys
+import time
+
+SIO_IDX = 0x4E
+SIO_DAT = 0x4F
+EXPECTED_CHIP_ID = 0x5570
+
+LOCKFILE = "/run/lock/gmktec-fanctl.lock"
+
+# --- EC internal address space -------------------------------------------
+TEMP = 0x0470            # CPU temperature, C (mirrors ACPI EC 0x70)
+RPM_HI, RPM_LO = 0x0298, 0x0299   # firmware-computed fan RPM, big-endian
+PWM_DUTY = 0x1805        # live PWM duty cycle register (DCR3), 0-255
+TACH_LO, TACH_HI = 0x181E, 0x181F  # tach period count, little-endian
+ACTIVE_LEVEL = 0x077D    # currently active curve level, 1-6
+
+# Fan curve table: six 5-byte records, the record for level N starting at
+# 0x075F + 5*(N-1), laid out [engage_temp, temp_alt, level, 0x00, duty].
+# A level is in effect between its own engage temperature and the next level's,
+# so BOUND_ADDR[i] (the engage temperature of level i+2) is equivalently the
+# upper bound of level i+1, which is how it is presented on the CLI.
+DUTY_ADDR = [0x0763, 0x0768, 0x076D, 0x0772, 0x0777, 0x077C]
+BOUND_ADDR = [0x0764, 0x0769, 0x076E, 0x0773, 0x0778]
+
+STOCK_DUTIES = [45, 54, 73, 91, 118, 183]
+STOCK_BOUNDS = [54, 61, 64, 74, 96]
+
+QUIET_DUTIES = [25, 32, 40, 50, 105, 183]
+
+TACH_CONST = 2160000     # RPM ~= TACH_CONST / tach_count
+
+_port = None
+
+
+def open_port():
+    global _port
+    try:
+        _port = open("/dev/port", "r+b", buffering=0)
+    except PermissionError:
+        sys.exit("permission denied on /dev/port - run as root")
+    except OSError as exc:
+        sys.exit("cannot open /dev/port (needs CONFIG_DEVPORT): %s" % exc)
+
+
+def outb(port, val):
+    _port.seek(port)
+    _port.write(bytes([val & 0xFF]))
+
+
+def inb(port):
+    _port.seek(port)
+    return _port.read(1)[0]
+
+
+def sio_enter():
+    for byte in (0x87, 0x01, 0x55, 0xAA):
+        outb(SIO_IDX, byte)
+
+
+def sio_exit():
+    outb(SIO_IDX, 0x02)
+    outb(SIO_DAT, 0x02)
+
+
+def sio_reg(reg):
+    outb(SIO_IDX, reg)
+    return inb(SIO_DAT)
+
+
+def _set_addr(addr):
+    outb(SIO_IDX, 0x2E)
+    outb(SIO_DAT, 0x11)
+    outb(SIO_IDX, 0x2F)
+    outb(SIO_DAT, (addr >> 8) & 0xFF)
+    outb(SIO_IDX, 0x2E)
+    outb(SIO_DAT, 0x10)
+    outb(SIO_IDX, 0x2F)
+    outb(SIO_DAT, addr & 0xFF)
+
+
+def sram_read(addr):
+    _set_addr(addr)
+    outb(SIO_IDX, 0x2E)
+    outb(SIO_DAT, 0x12)
+    outb(SIO_IDX, 0x2F)
+    return inb(SIO_DAT)
+
+
+def sram_write(addr, val):
+    _set_addr(addr)
+    outb(SIO_IDX, 0x2E)
+    outb(SIO_DAT, 0x12)
+    outb(SIO_IDX, 0x2F)
+    outb(SIO_DAT, val)
+
+
+def require_chip():
+    chip = (sio_reg(0x20) << 8) | sio_reg(0x21)
+    if chip != EXPECTED_CHIP_ID:
+        raise SystemExit(
+            "unexpected Super I/O chip 0x%04X (expected 0x%04X for IT5570E); "
+            "refusing to touch EC registers" % (chip, EXPECTED_CHIP_ID))
+    return chip
+
+
+def read_state():
+    tach = sram_read(TACH_LO) | (sram_read(TACH_HI) << 8)
+    return {
+        "temp": sram_read(TEMP),
+        "duty": sram_read(PWM_DUTY),
+        "rpm": (sram_read(RPM_HI) << 8) | sram_read(RPM_LO),
+        "tach": tach,
+        "tach_rpm": (TACH_CONST // tach) if tach else 0,
+        "level": sram_read(ACTIVE_LEVEL),
+        "duties": [sram_read(a) for a in DUTY_ADDR],
+        "bounds": [sram_read(a) for a in BOUND_ADDR],
+    }
+
+
+def parse_list(text, count, lo, hi, what):
+    parts = [p for p in text.replace(",", " ").split() if p]
+    if len(parts) != count:
+        raise SystemExit("%s needs exactly %d values, got %d" % (what, count, len(parts)))
+    out = []
+    for p in parts:
+        try:
+            v = int(p, 0)
+        except ValueError:
+            raise SystemExit("%s: %r is not an integer" % (what, p))
+        if not lo <= v <= hi:
+            raise SystemExit("%s: %d out of range %d..%d" % (what, v, lo, hi))
+        out.append(v)
+    return out
+
+
+# --- commands ------------------------------------------------------------
+
+def cmd_status(_args):
+    chip = require_chip()
+    s = read_state()
+    print("ITE IT5570E EC (Super I/O 0x%02X, chip id 0x%04X)" % (SIO_IDX, chip))
+    print("  cpu temperature : %d C" % s["temp"])
+    print("  fan duty        : %d/255  (%d%%)" % (s["duty"], s["duty"] * 100 // 255))
+    print("  fan speed       : %d rpm   (tach count %d -> %d rpm)"
+          % (s["rpm"], s["tach"], s["tach_rpm"]))
+    print("  active level    : %d" % s["level"])
+    print()
+    print("  level  duty  ( % )  temp bound")
+    for i in range(6):
+        bound = ("<= %d C" % s["bounds"][i]) if i < 5 else "above"
+        mark = "  <-- active" if s["level"] == i + 1 else ""
+        print("    %d    %3d   (%3d%%)  %-8s%s"
+              % (i + 1, s["duties"][i], s["duties"][i] * 100 // 255, bound, mark))
+    stock = s["duties"] == STOCK_DUTIES and s["bounds"] == STOCK_BOUNDS
+    print()
+    print("  curve is %s" % ("stock (factory)" if stock else "modified"))
+
+
+def _apply(duties, bounds, quiet=False):
+    require_chip()
+    for addr, val in zip(DUTY_ADDR, duties):
+        sram_write(addr, val)
+    for addr, val in zip(BOUND_ADDR, bounds):
+        sram_write(addr, val)
+
+    bad = []
+    for addr, val in list(zip(DUTY_ADDR, duties)) + list(zip(BOUND_ADDR, bounds)):
+        got = sram_read(addr)
+        if got != val:
+            bad.append("0x%04X: wrote %d read %d" % (addr, val, got))
+    if bad:
+        raise SystemExit("verification failed -> " + "; ".join(bad))
+
+    if not quiet:
+        s = read_state()
+        print("applied duties=%s bounds=%s" % (duties, bounds))
+        print("  now: level %d, %d C, duty %d, %d rpm"
+              % (s["level"], s["temp"], s["duty"], s["rpm"]))
+
+
+def cmd_apply(args):
+    duties = parse_list(args.duties, 6, 0, 255, "--duties")
+    bounds = parse_list(args.bounds, 5, 0, 120, "--bounds")
+    _apply(duties, bounds, quiet=args.quiet)
+
+
+def cmd_restore(args):
+    _apply(STOCK_DUTIES, STOCK_BOUNDS, quiet=args.quiet)
+    if not args.quiet:
+        print("factory curve restored")
+
+
+def cmd_set(args):
+    """Write the live PWM register. The EC overwrites this within ~1s."""
+    require_chip()
+    sram_write(PWM_DUTY, args.duty)
+    print("wrote duty %d to PWM register 0x%04X (transient - EC will overwrite)"
+          % (args.duty, PWM_DUTY))
+
+
+def cmd_monitor(args):
+    require_chip()
+    print("%-8s %-6s %-6s %-7s %-6s" % ("time", "temp", "duty", "rpm", "level"))
+    end = time.time() + args.seconds if args.seconds else None
+    while end is None or time.time() < end:
+        s = read_state()
+        print("%-8s %-6s %-6s %-7s %-6s"
+              % (time.strftime("%H:%M:%S"), "%dC" % s["temp"],
+                 s["duty"], s["rpm"], s["level"]))
+        sys.stdout.flush()
+        time.sleep(args.interval)
+
+
+def cmd_dump(args):
+    require_chip()
+    data = bytearray(0x2000)
+    for addr in range(0x2000):
+        data[addr] = sram_read(addr)
+    if args.output == "-":
+        sys.stdout.buffer.write(bytes(data))
+    else:
+        with open(args.output, "wb") as fh:
+            fh.write(bytes(data))
+        print("wrote 8192 bytes of EC SRAM to %s" % args.output)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="gmktec-fanctl",
+        description="Fan control for the ITE IT5570E EC (GMKtec M5 PLUS).")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("status", help="show fan state and the current curve")
+
+    p = sub.add_parser("apply", help="write a fan curve into the EC")
+    p.add_argument("--duties", default=",".join(str(d) for d in QUIET_DUTIES),
+                   help="6 PWM duties 0-255 for levels 1-6 (default: quiet curve %s)"
+                        % ",".join(str(d) for d in QUIET_DUTIES))
+    p.add_argument("--bounds", default=",".join(str(b) for b in STOCK_BOUNDS),
+                   help="5 upper temperature bounds in C for levels 1-5 (default: stock)")
+    p.add_argument("-q", "--quiet", action="store_true")
+
+    p = sub.add_parser("restore", help="restore the factory curve")
+    p.add_argument("-q", "--quiet", action="store_true")
+
+    p = sub.add_parser("set", help="force the live PWM duty (transient)")
+    p.add_argument("duty", type=lambda v: int(v, 0))
+
+    p = sub.add_parser("monitor", help="continuously print fan state")
+    p.add_argument("-i", "--interval", type=float, default=1.0)
+    p.add_argument("-s", "--seconds", type=float, default=0.0,
+                   help="stop after N seconds (0 = run forever)")
+
+    p = sub.add_parser("dump", help="dump the 8KB EC SRAM (for reverse engineering)")
+    p.add_argument("-o", "--output", default="-")
+
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.print_help()
+        return
+
+    if args.cmd == "set" and not 0 <= args.duty <= 255:
+        raise SystemExit("duty must be 0..255")
+
+    if os.geteuid() != 0:
+        sys.exit("must run as root")
+
+    open_port()
+
+    # Serialise access: concurrent SIO index/data sequences would interleave.
+    os.makedirs(os.path.dirname(LOCKFILE), exist_ok=True)
+    with open(LOCKFILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            sio_enter()
+            {
+                "status": cmd_status,
+                "apply": cmd_apply,
+                "restore": cmd_restore,
+                "set": cmd_set,
+                "monitor": cmd_monitor,
+                "dump": cmd_dump,
+            }[args.cmd](args)
+        finally:
+            sio_exit()
+
+
+if __name__ == "__main__":
+    main()
