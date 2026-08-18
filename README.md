@@ -57,7 +57,7 @@ Custom curve — six duties (levels 1–6, `0..255`) and five upper temperature
 bounds in °C (levels 1–5; level 6 is the top step):
 
 ```bash
-sudo ./gmktec-fanctl apply --duties 25,32,40,50,105,183 --bounds 54,61,64,74,96
+sudo ./gmktec-fanctl apply --duties 25,32,40,50,118,183 --bounds 54,61,64,74,96
 ```
 
 Changes live in EC SRAM only. **A power cycle restores the factory curve**, which
@@ -71,7 +71,7 @@ makes experimenting safe. `restore` also puts it back immediately.
 
   hardware.gmktecFanControl = {
     enable = true;
-    # duties = [ 25 32 40 50 105 183 ];   # default quiet curve
+    # duties = [ 25 32 40 50 118 183 ];   # default quiet curve
     # tempBounds = [ 54 61 64 74 96 ];    # default = stock bounds
   };
 }
@@ -94,8 +94,9 @@ Stock:
 | 5 | 118 | 46% | ≤ 96 °C | ~3600 |
 | 6 | 183 | 71% | above | ~4600 |
 
-Built-in quiet curve (`apply` with no arguments). Level 6 is deliberately left
-at the stock value so the fan still ramps to full above 96 °C:
+Built-in quiet curve (`apply` with no arguments). Levels 5 and 6 are left at the
+factory values, so cooling under sustained load is **identical to stock** and
+only the quiet steps change:
 
 | level | duty | % | rpm |
 |---|---|---|---|
@@ -103,8 +104,8 @@ at the stock value so the fan still ramps to full above 96 °C:
 | 2 | 32 | 12% | ~800 |
 | 3 | 40 | 15% | ~1180 |
 | 4 | **50** | 19% | **~1500** |
-| 5 | 105 | 41% | ~3000 |
-| 6 | 183 | 71% | ~4600 |
+| 5 | 118 | 46% | ~3600 (stock) |
+| 6 | 183 | 71% | ~4600 (stock) |
 
 Measured duty → rpm on this unit:
 
@@ -114,6 +115,27 @@ Measured duty → rpm on this unit:
 
 Duty `0` stops the fan. The fan still spins reliably at duty `10` (295 rpm), so
 there is no stall risk anywhere in the usable range.
+
+## Behaviour under load
+
+The EC ramps duty gradually rather than jumping, roughly one duty step per
+second. Measured on a 16-thread busy loop with the quiet curve applied, duty
+climbed `50 → 105` over about a minute while the CPU sat at 93 °C, then settled.
+Because the ramp is slow, brief load spikes do not audibly spin the fan up,
+which is most of the benefit.
+
+If you lower levels 5 and 6 as well, you are trading peak thermal headroom for
+noise you will only hear under load. A variant with level 5 at duty 105 and the
+level-4 band widened to 82 °C reached 93 °C under the same stress, versus about
+90 °C on the stock curve — safe against the 5825U's 105 °C Tjmax, but not worth
+it. The default therefore leaves levels 5 and 6 alone.
+
+If your machine idles right at the 74 °C level-4 boundary and keeps flipping up
+to level 5, widen the quiet band instead of lowering level 5:
+
+```bash
+sudo ./gmktec-fanctl apply --bounds 54,61,64,80,96
+```
 
 ## Register map
 

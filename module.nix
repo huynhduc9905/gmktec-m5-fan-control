@@ -28,15 +28,15 @@ in
 
     duties = lib.mkOption {
       type = lib.types.listOf (lib.types.ints.between 0 255);
-      default = [ 25 32 40 50 105 183 ];
+      default = [ 25 32 40 50 118 183 ];
       description = ''
         PWM duty (0-255) for fan curve levels 1 through 6. The factory values
         are [ 45 54 73 91 118 183 ].
 
         Level 4 covers everything up to 74 C, so on a machine that idles near
         70 C it is the step that runs permanently, and lowering it is what
-        removes the noise. Level 6 defaults to the stock value so the fan still
-        ramps fully above 96 C.
+        removes the noise. Levels 5 and 6 default to the factory values, so
+        cooling under sustained load is unchanged from stock.
 
         Approximate duty to rpm on the M5 PLUS 40 mm fan:
         10:295 20:499 30:731 40:1177 50:1517 60:1806 75:2268 91:2703
