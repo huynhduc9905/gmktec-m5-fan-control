@@ -137,6 +137,61 @@ to level 5, widen the quiet band instead of lowering level 5:
 sudo ./gmktec-fanctl apply --bounds 54,61,64,80,96
 ```
 
+## Tools
+
+### `tools/tdp.sh` — sustained power limit
+
+Fan noise on this machine turned out to be a symptom of its thermal behaviour,
+so the same investigation produced a power-limit tool. It wraps
+[ryzenadj](https://github.com/FlyGoat/RyzenAdj) and re-reads every value back
+after writing, because the BIOS silently clips some of them.
+
+```bash
+sudo ./tools/tdp.sh 50          # set 50 W (30/40/45/50/55/60 all valid, 10-65 accepted)
+sudo ./tools/tdp.sh status      # limits plus live power and temperature
+sudo ./tools/tdp.sh watch       # live power / STAPM / EDC / temp / clocks
+sudo ./tools/tdp.sh reset       # factory 35 W / 42 W APU / 51 A / 105 A / 93 C
+sudo ./tools/tdp.sh hold 50     # re-apply every 60 s to survive suspend/resume
+```
+
+It re-execs itself inside `nix shell nixpkgs#ryzenadj` if ryzenadj is not on
+`PATH`, so no prefix is needed. `stapm`, `fast` and `slow` limits are set
+together and `apu-slow-limit` follows at watts+7, matching the stock 35/42
+ratio. `--max-current` additionally raises TDC to 60 A and EDC to 115 A, their
+hard caps; that is optional, since at 55 W the TDC peaked at 40 A of 60 and the
+EDC at 80 A of 115, so neither was limiting.
+
+Measured on this unit after replacing the thermal paste and adding thermal putty
+to the VRM:
+
+| limits set | actual sustained | all-core clocks | throughput |
+|---|---|---|---|
+| 35 W (stock) | 32.8 W | 3192 MHz | 17661 bogo/s |
+| 45 W | 42.3 W | 3396 MHz | 18145 bogo/s |
+| 50–55 W | ~46 W (ceiling) | ~3490 MHz | 19427 bogo/s |
+
+Power saturates near **46–47 W** because the die reaches its 93 °C limit, so
+values above about 50 W raise a ceiling nothing reaches. That 93 °C figure is a
+hard floor on what software can do: Tjmax is 95 °C and the BIOS clips any
+`tctl-temp` write above 93 (writing 100 reads back as 93.001, while writing 85
+takes effect). Fan speed does not help either — repeating the 55 W run with the
+fan pinned at maximum for its entire duration gave 46.4 W against 45.4 W, which
+is within run-to-run noise.
+
+All changes are volatile: they are lost on reboot, and the SMU also clears them
+on suspend/resume, which is what `hold` is for.
+
+### `tools/correlate.py` — register discovery
+
+Ranks every byte of EC SRAM by how strongly it correlates with CPU temperature
+across an idle → stress → cooldown cycle. This is the instrument that found the
+register map below, and the place to start if you are porting to another board.
+
+```bash
+sudo ./tools/correlate.py capture --out run1   # dump SRAM across a thermal cycle
+./tools/correlate.py analyze --dir run1        # rank bytes against temperature
+```
+
 ## Register map
 
 The EC's internal address space is reached through the **SMFI indirect window**
